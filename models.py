@@ -14,7 +14,7 @@ class DualReadoutMACE(nn.Module):
         print("Zamrażanie parametrów całego modelu bazowego MACE...")
         for param in self.mace_model.parameters():
             param.requires_grad = False
-        self.mace_model.eval()
+        # self.mace_model.eval() # Removed: Let the training script handle train/eval mode
 
         if not hasattr(self.mace_model, 'products') or not isinstance(self.mace_model.products, nn.ModuleList) or len(self.mace_model.products) == 0:
             raise AttributeError("Model MACE nie ma atrybutu 'products'. Hak nie może zostać zarejestrowany.")
@@ -47,7 +47,10 @@ class DualReadoutMACE(nn.Module):
         if compute_force:
             data["positions"].requires_grad_(True)
 
+        # A forward pass is needed to trigger the hook and get features
         base_output = self.mace_model(data, compute_force=False)
+        # The base_energy doesn't need to be detached. Gradients won't flow
+        # to the base model anyway since its parameters have requires_grad=False.
         base_energy = base_output["energy"]
 
         if self.features is None:
@@ -65,11 +68,12 @@ class DualReadoutMACE(nn.Module):
             forces = -torch.autograd.grad(
                 outputs=final_energy.sum(),
                 inputs=data["positions"],
-                create_graph=False,
-                retain_graph=False,
+                create_graph=self.training, # Create graph if in training mode
+                retain_graph=self.training,
             )[0]
-            output_data["forces"] = forces.detach()
+            output_data["forces"] = forces
 
-        output_data["energy"] = final_energy.detach()
+        # Return the final energy attached to the graph for training
+        output_data["energy"] = final_energy
         return output_data
 
