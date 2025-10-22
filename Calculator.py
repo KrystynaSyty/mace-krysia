@@ -1,108 +1,82 @@
-###########################################################################################
-# An ASE Calculator for the custom DualReadoutMACE model.
-#
-# This version has been made more flexible to support two use cases:
-#  1. Creating a new delta-learning model from a baseline MACE model.
-#  2. Loading a fully trained DualReadoutMACE model directly.
-###########################################################################################
-
 import torch
 import numpy as np
-from typing import Dict, Optional
-
-# ASE imports
+from typing import Dict, Optional, Union
+from typing import Dict, List
 from ase.calculators.calculator import Calculator, all_changes
-
-# MACE imports - ensure 'mace-torch' is installed
 from mace import data
 from mace.tools import torch_geometric, torch_tools, utils
-
-# Your custom model import
 from models import DualReadoutMACE
 
-
-
-class DeltaMaceCalculator(Calculator):
+class DualReadoutMACECalculator(Calculator):
     """
     Custom MACE ASE Calculator for the DualReadoutMACE model.
-
-    This calculator can be initialized in two ways:
-
-    1. To create a NEW delta model for training or inference:
-       >> calc = DualReadoutMACECalculator(base_model_path='path/to/base.model')
-
-    2. To load a fully TRAINED delta model for inference:
-       >> calc = DualReadoutMACECalculator(model_path='path/to/trained_delta.pt')
     """
     implemented_properties = ["energy", "forces"]
 
     def __init__(
         self,
-        base_model_path: Optional[str] = None,
-        model_path: Optional[str] = None,
-        model: Optional[torch.nn.Module] = None,
-        device: str = "cpu",
-        energy_units_to_eV: float = 1.0,
-        length_units_to_A: float = 1.0,
+        base_model_path: str,
+        model_path: str,
+        vacuum_energy_shifts: Optional[torch.Tensor] = None,
+        device: Union[str, torch.device] = "cpu",
         default_dtype="float64",
-        **kwargs,
+        **kwargs
     ):
         Calculator.__init__(self, **kwargs)
-        
-        # --- MODIFIED LOGIC ---
-        # Ensure exactly one model source is provided to avoid ambiguity.
-        num_provided = sum(arg is not None for arg in [base_model_path, model_path, model])
-        if num_provided != 1:
-            raise ValueError(
-                "You must provide exactly one of 'base_model_path' (to create a new model), "
-                "'model_path' (to load a trained model), or a 'model' object."
-            )
 
-        self.device = torch_tools.init_device(device)
+        if isinstance(device, str):
+            self.device = torch_tools.init_device(device)
+        else:
+            self.device = device
+
         torch_tools.set_default_dtype(default_dtype)
-        
-        base_mace_model = None
 
-        if base_model_path is not None:
-            # --- Scenario A: Create a NEW delta model from a base model ---
-            print(f"Loading baseline MACE model from: {base_model_path}")
-            base_mace_model = torch.load(f=base_model_path, map_location=self.device)
-            print("Wrapping baseline model with a new DualReadoutMACE...")
-            self.model = DualReadoutMACE(base_mace_model=base_mace_model)
+        # 1. Load the state dictionary from your trained DualReadoutMACE model.
+        #    This file contains the learned weights and any saved buffers (like atomic_energy_shifts).
+        print(f"INFO: Loading state dictionary from: {model_path}")
+        state_dict = torch.load(model_path, map_location=self.device)
 
-        elif model_path is not None:
-            # --- Scenario B: Load a pre-trained, complete delta model ---
-            print(f"Loading fully trained DualReadoutMACE model from: {model_path}")
-            self.model = torch.load(f=model_path, map_location=self.device)
-            # The base model is a submodule of the loaded model
-            base_mace_model = self.model.mace_model
+        # 2. Extract the 'atomic_energy_shifts' buffer from the state_dict if it exists.
+        #    This is essential for recreating the exact model architecture before loading weights.
+        #    We use state_dict.get() to safely return None if the key doesn't exist.
+        extracted_shifts = state_dict.get('atomic_energy_shifts', None)
+        if extracted_shifts is not None:
+            print("INFO: Found and extracted 'atomic_energy_shifts' from the model file.")
+        else:
+            print("INFO: No 'atomic_energy_shifts' buffer found in the model file.")
+
+        # 3. Load the base MACE model. This is a required component to build the
+        #    DualReadoutMACE architecture.
+        print(f"INFO: Loading baseline MACE model from: {base_model_path}")
+        base_mace_model = torch.load(f=base_model_path, map_location=self.device)
         
-        elif model is not None:
-            # --- Scenario C: Use a pre-initialized model object ---
-            print("Using a provided DualReadoutMACE model object.")
-            self.model = model
-            base_mace_model = self.model.mace_model
+        # 4. Now, create an instance of the DualReadoutMACE model architecture.
+        #    It's critical to use the base model and the extracted shifts to ensure
+        #    the architecture is identical to the one that was saved.
+        self.model = DualReadoutMACE(
+            base_mace_model=base_mace_model,
+            vacuum_energy_shifts=extracted_shifts # Pass the extracted shifts here
+        )
+
+        # 5. Finally, load the weights and buffers from the state_dict into the
+        #    correctly-built model instance.
+        print("INFO: Loading trained weights into the model architecture...")
+        self.model.load_state_dict(state_dict)
 
         if not isinstance(self.model, DualReadoutMACE):
-            raise TypeError("The loaded or created model is not a DualReadoutMACE instance.")
+            raise TypeError("The loaded model is not a DualReadoutMACE instance.")
 
-        # Set up device, dtype, and freeze parameters for inference
+        # Common setup for inference
         self.model.to(device=self.device, dtype=torch.get_default_dtype())
-        self.model.eval() # Set to evaluation mode
-
-        # Since this is a calculator for inference, we freeze the gradients.
+        self.model.eval()
         for param in self.model.parameters():
             param.requires_grad = False
 
-        print(f"Calculator initialized on device '{self.device}' with dtype '{default_dtype}'.")
+        print(f"Calculator initialized successfully on device '{self.device}'.")
 
-        # Store constants and utilities from the base model
+        # Store necessary parameters for the calculator
         self.r_max = float(base_mace_model.r_max)
-        self.z_table = utils.AtomicNumberTable(
-            [int(z) for z in base_mace_model.atomic_numbers]
-        )
-        self.energy_units_to_eV = energy_units_to_eV
-        self.length_units_to_A = length_units_to_A
+        self.z_table = utils.AtomicNumberTable([int(z) for z in base_mace_model.atomic_numbers])
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
         if properties is None:
@@ -110,8 +84,8 @@ class DeltaMaceCalculator(Calculator):
         Calculator.calculate(self, atoms, properties, system_changes)
         batch = self._atoms_to_batch(atoms)
         out = self.model(batch.to_dict(), compute_force=True)
-        self.results["energy"] = out["energy"].detach().cpu().item() * self.energy_units_to_eV
-        self.results["forces"] = out["forces"].detach().cpu().numpy() * (self.energy_units_to_eV / self.length_units_to_A)
+        self.results["energy"] = out["energy"].detach().cpu().item()
+        self.results["forces"] = out["forces"].detach().cpu().numpy()
 
     def _atoms_to_batch(self, atoms) -> Dict[str, torch.Tensor]:
         config = data.config_from_atoms(atoms)
@@ -120,5 +94,3 @@ class DeltaMaceCalculator(Calculator):
             batch_size=1, shuffle=False, drop_last=False,
         )
         return next(iter(data_loader)).to(self.device)
-
-
