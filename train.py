@@ -138,3 +138,58 @@ def evaluate(model: nn.Module, data_loader: PyGDataLoader, loss_fn: nn.Module, d
     print(f"Final Energy MAE per atom (metric): {final_energy_mae_per_atom:.4f} eV/atom")
     
     return avg_loss, delta_mae, delta_rmse, final_energy_mae_per_atom
+
+
+def train_model(
+    model: nn.Module,
+    train_loader: PyGDataLoader,
+    val_loader: PyGDataLoader,
+    loss_fn: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    device: torch.device,
+    num_epochs: int,
+):
+    """Main training loop."""
+    best_val_mae = float('inf')
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_train_loss = 0.0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            
+            # Convert batch to dictionary for model input
+            data_dict = batch.to_dict()
+            if 'pos' in data_dict:
+                data_dict['positions'] = data_dict.pop('pos')
+
+            output = model(data_dict)
+            loss = loss_fn(output, batch)
+            loss.backward()
+            optimizer.step()
+            total_train_loss += loss.item() * batch.num_graphs
+
+        avg_train_loss = total_train_loss / len(train_loader.dataset)
+        
+        # --- Evaluation ---
+        val_loss, val_delta_mae, val_delta_rmse, val_final_mae_per_atom = evaluate(
+            model, val_loader, loss_fn, device
+        )
+        
+        print(
+            f"Epoch {epoch+1}/{num_epochs} | Train Loss: {avg_train_loss:.4f} | "
+            f"Val Loss: {val_loss:.4f} | Val Delta MAE: {val_delta_mae:.4f} | "
+            f"Val Final Energy MAE/atom: {val_final_mae_per_atom:.4f} eV/atom"
+        )
+
+        if scheduler:
+            scheduler.step(val_final_mae_per_atom)
+
+        if val_final_mae_per_atom < best_val_mae:
+            best_val_mae = val_final_mae_per_atom
+            print(f"New best validation MAE: {best_val_mae:.4f}. Saving model...")
+            # torch.save(model.state_dict(), "best_model.pt") # Example saving
+
+    print("Training complete.")
