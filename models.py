@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List
+from typing import Dict, List, Union
 import numpy as np
 import logging
 from torch_geometric.nn import global_add_pool
@@ -179,20 +179,20 @@ class DualReadoutMACE(nn.Module):
         self,
         base_mace_model: nn.Module,
         vacuum_energy_shifts: torch.Tensor = None,
-        mlp_hidden_features: List[int] = [32],
+        mlp_hidden_features: Union[List[int], str] = "auto",  # Changed default
         mlp_activation: str = "silu",
         use_pca: bool = False,
-        pca_variance_threshold: float = 0.99 # <<< Takes threshold directly
+        pca_variance_threshold: float = 0.99
     ):
         super().__init__()
         self.features = None
         self.mace_model = base_mace_model
         self.use_pca = use_pca
-        
-        # --- Store config for later initialization ---
-        self.mlp_hidden_features = mlp_hidden_features
+    
+        # Store config for later initialization
+        self.mlp_hidden_features_config = mlp_hidden_features
         self.mlp_activation = mlp_activation
-        
+    
         # --- Initialize layers that don't depend on data ---
         print("Freezing parameters of the entire base MACE model...")
         for param in self.mace_model.parameters():
@@ -200,10 +200,10 @@ class DualReadoutMACE(nn.Module):
 
         if not hasattr(self.mace_model, 'products'):
             raise AttributeError("Base MACE model does not have 'products' attribute.")
-
+    
         num_features = self.mace_model.readouts[0].linear.irreps_in.dim
         print(f"Detected {num_features} input features for the readout head.")
-
+    
         self.pca_layer = None
         if self.use_pca:
             self.pca_layer = PCALayer(
@@ -212,20 +212,18 @@ class DualReadoutMACE(nn.Module):
             )
             print(f"PCA layer enabled with a {pca_variance_threshold:.2%} variance threshold.")
 
-        # The readout layer is NOT created yet. It will be created in finalize_model().
         self.delta_readout = None
         
         if vacuum_energy_shifts is not None:
             self.register_buffer('atomic_energy_shifts', vacuum_energy_shifts)
         else:
             self.atomic_energy_shifts = 0
-
+    
         self.mace_model.products[-1].register_forward_hook(self._hook_fn)
-
+    
     def finalize_model(self, features: torch.Tensor):
         """
-        Finalizes the model architecture by fitting PCA (if used) and creating the readout layer.
-        This method MUST be called before training or inference.
+        Finalizes the model architecture by fitting PCA and creating a dynamically sized readout layer.
         """
         readout_in_features = features.shape[1]
         
@@ -233,33 +231,51 @@ class DualReadoutMACE(nn.Module):
             self.pca_layer.fit(features)
             readout_in_features = self.pca_layer.n_components
         
-        print(f"Finalizing model. Readout head will have {readout_in_features} input features.")
+        if isinstance(self.mlp_hidden_features_config, str) and self.mlp_hidden_features_config.lower() == 'auto':
+            h1_features = readout_in_features
+            final_mlp_hidden_features = [h1_features]
+            logging.info(f"Automatically determined MLP hidden features based on PCA output: {final_mlp_hidden_features}")
+        elif isinstance(self.mlp_hidden_features_config, list):
+            final_mlp_hidden_features = self.mlp_hidden_features_config
+        else:
+            raise TypeError("mlp_hidden_features must be a list of integers or the string 'auto'.")
+        # --- END OF DYNAMIC LOGIC ---
+
+        logging.info(f"Finalizing model. Readout head will have {readout_in_features} input features.")
         self.delta_readout = MLPReadout(
             in_features=readout_in_features,
-            hidden_features=self.mlp_hidden_features,
+            hidden_features=final_mlp_hidden_features, # Use the determined list
             activation=self.mlp_activation,
             out_features=1
         )
-        
+    
         # Move new layer to the correct device and dtype
         device = next(self.mace_model.parameters()).device
         dtype = next(self.mace_model.parameters()).dtype
         self.delta_readout.to(device=device, dtype=dtype)
-        
+    
         # Initialize final layer weights to zero
         final_layer = self.delta_readout.mlp[-1]
         torch.nn.init.zeros_(final_layer.weight)
         if final_layer.bias is not None:
              torch.nn.init.zeros_(final_layer.bias)
-        print("Model has been finalized and is ready for training.")
-
+        logging.info("Model has been finalized and is ready for training.")
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
-        dtype = next(self.mace_model.parameters()).dtype
+        # This part ensures the base model and its components are moved.
+        # Now, handle the optional, lazily-initialized parts.
+        
+        # Get the target device and dtype from the base model's state
         device = next(self.mace_model.parameters()).device
+        dtype = next(self.mace_model.parameters()).dtype
+
         if self.pca_layer:
             self.pca_layer.to(device=device, dtype=dtype)
-        self.delta_readout.to(device=device, dtype=dtype)
+        
+        # Add this check to prevent the error
+        if self.delta_readout is not None:
+            self.delta_readout.to(device=device, dtype=dtype)
+            
         return self
 
     def _hook_fn(self, module, input_data, output_data):
