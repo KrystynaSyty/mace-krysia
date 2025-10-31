@@ -12,65 +12,11 @@ from ase import Atoms
 from mace.calculators import MACECalculator
 
 # Import all necessary components from your other files
-from models import DualReadoutMACE, compute_E_statistics_vectorized
-from train import evaluate, DeltaEnergyLoss, load_data, pyg_collate, AtomsDataset
+from models.models import DualReadoutMACE, compute_E_statistics_vectorized, print_model_summary, get_vacuum_energies
+from train.train import evaluate, DeltaEnergyLoss, load_data, pyg_collate, AtomsDataset
 
 # Setup basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-
-def get_vacuum_energies(calc_mace_off: MACECalculator, calc_mace_mp: MACECalculator, z_list: List[int]) -> Dict[int, float]:
-    """Calculates the energy (mace_off) for single, isolated atoms."""
-    logging.info("Calculating vacuum energies for regression baseline...")
-    vacuum_energies = {}
-    unique_atomic_numbers = sorted(list(set(z_list)))
-    
-    for z in unique_atomic_numbers:
-        atom = Atoms(numbers=[z])
-        atom.calc = calc_mace_off
-        vacuum_ref = atom.get_potential_energy()
-        atom.calc = calc_mace_mp
-        vacuum_base = atom.get_potential_energy()
-        vacuum_energies[z] = vacuum_ref - vacuum_base
-        logging.info(f"  - Referance vacuum energy for Z={z}: {vacuum_ref:.4f} eV")
-        logging.info(f"  - Base vacuum energy for Z={z}: {vacuum_base:.4f} eV")
-    return vacuum_energies
-
-
-def print_model_summary(model: DualReadoutMACE):
-    """
-    Prints a detailed summary of the DualReadoutMACE model, including
-    total, trainable, and frozen parameters.
-    """
-    print("\n" + "="*80)
-    print("           Model Summary: 'DualReadoutMACE'")
-    print("="*80)
-    print(model)
-    print("-"*80)
-
-    if model.delta_readout is None:
-        print("\nModel is not yet finalized. Trainable parameters will be determined after finalization.")
-        print("="*80)
-        return
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(f"\nTotal parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-    print(f"Frozen parameters: {total_params - trainable_params:,}")
-    
-    print("\nDetails of Trainable Parameters:")
-    found_trainable = False
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            print(f"  - Layer: '{name}' | Size: {list(param.shape)} | Status: Trainable")
-            found_trainable = True
-    
-    if not found_trainable:
-        print("  - No trainable parameters found.")
-        
-    print("="*80)
 
 
 def main():
