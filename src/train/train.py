@@ -9,9 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
+from torch.utils.data import DataLoader as StandardDataLoader, TensorDataset, Dataset
 from torch_geometric.loader import DataLoader as PyGDataLoader
-from torch_geometric.nn import global_add_pool
-
+ 
+from tqdm import tqdm
 
 
 def load_data(xyz_path: str) -> List[ase.Atoms]:
@@ -82,8 +83,9 @@ class DeltaEnergyLoss(nn.Module):
         super().__init__()
         self.mse = nn.MSELoss()
 
-    def forward(self, pred: Dict[str, torch.Tensor], ref: Data) -> torch.Tensor:
-        return self.mse(pred["delta_energy"], ref.y)
+    def forward(self, pred: Dict[str, torch.Tensor], ref: Dict[str, torch.Tensor]) -> torch.Tensor:
+        # Access 'y' as a dictionary key, not an attribute
+        return self.mse(pred["delta_energy"], ref["y"])
 
 def evaluate(model: nn.Module, data_loader: PyGDataLoader, loss_fn: nn.Module, device: torch.device) -> Tuple[float, float, float, float]:
     """
@@ -143,6 +145,9 @@ def evaluate(model: nn.Module, data_loader: PyGDataLoader, loss_fn: nn.Module, d
     return avg_loss, delta_mae, delta_rmse, final_energy_mae_per_atom
 
 
+
+
+
 def train_model(
     model: nn.Module,
     train_loader: PyGDataLoader,
@@ -197,146 +202,4 @@ def train_model(
 
     print("Training complete.")
 
-
-# --- NEW HELPER FUNCTION 1 ---
-def precompute_dataset(
-    model: 'DualReadoutMACE', dataloader: PyGDataLoader, device: torch.device
-) -> List[Data]:
-    """
-    Runs the expensive base model once and stores the features, base energy,
-    and labels for fast training.
-    """
-    logging.info(f"Starting pre-computation for {len(dataloader.dataset)} samples...")
-    model.eval()
-    precomputed_data_list = []
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = batch.to(device)
-            data_dict = batch.to_dict()
-            if "pos" in data_dict:
-                data_dict["positions"] = data_dict.pop("pos")
-
-            # Run the expensive part
-            base_output = model.mace_model(data_dict, compute_force=False)
-            features = model.features.cpu()  # [N_atoms_in_batch, 128]
-            base_energies = base_output["energy"].cpu()  # [N_graphs_in_batch]
-            model.features = None  # Reset hook
-
-            # De-collate the batch to get individual graph data
-            original_data_list = batch.to_data_list()
-            ptr = batch.ptr.cpu()
-
-            for i in range(len(original_data_list)):
-                original_data = original_data_list[i]
-                start, end = ptr[i], ptr[i + 1]
-
-                # Extract features for this specific graph
-                graph_features = features[start:end]
-                graph_base_energy = base_energies[i]  # Get the energy for this graph
-
-                # Create a new, lightweight Data object
-                new_data = Data(
-                    x=graph_features,  # The pre-computed features
-                    y=original_data.y.cpu(),
-                    base_energy=graph_base_energy,  # Store the base energy
-                    true_final_energy=original_data.true_final_energy.cpu(),
-                    #
-                    # --- FIX IS HERE ---
-                    # Use dictionary access to get the tensor, not the method
-                    node_attrs=original_data["node_attrs"].cpu(),
-                    #
-                    # This is a placeholder; the new DataLoader will create the correct batch map
-                    batch_map=torch.zeros(graph_features.shape[0], dtype=torch.long),
-                )
-                precomputed_data_list.append(new_data)
-
-    logging.info("Pre-computation complete.")
-    return precomputed_data_list
-
-
-# --- NEW HELPER FUNCTION 2 ---
-def evaluate_fast(
-    model: 'DualReadoutMACE',
-    data_loader: PyGDataLoader,
-    loss_fn: nn.Module,
-    device: torch.device,
-) -> Tuple[float, float, float, float]:
-    """
-    Evaluates the model using PRE-COMPUTED features.
-    This is a modified version of the `evaluate` function from train.py.
-    """
-    model.eval()
-    total_loss = 0.0
-    all_pred_deltas = []
-    all_true_deltas = []
-    all_final_energy_abs_errors_per_atom = []
-
-    with torch.no_grad():
-        for batch in data_loader:
-            batch = batch.to(device)
-
-            # === Manually replicate the model's forward pass ===
-            processed_features = batch.x  # 'x' is where we stored features
-            if model.use_pca:
-                processed_features = model.pca_layer(processed_features)
-
-            atomic_delta_prediction = model.delta_readout(processed_features)
-
-            if isinstance(model.atomic_energy_shifts, torch.Tensor):
-                #
-                # --- FIX IS HERE ---
-                # Use dictionary access to get the tensor, not the method
-                node_indices = torch.argmax(batch["node_attrs"], dim=1)
-                #
-                shifts = model.atomic_energy_shifts[node_indices].unsqueeze(-1)
-                total_atomic_delta = atomic_delta_prediction + shifts
-            else:
-                total_atomic_delta = atomic_delta_prediction
-
-            batch_map = (
-                batch.batch
-            )  # This is the *new* batch map from val_loader_fast
-            delta_energy = global_add_pool(total_atomic_delta, batch_map).squeeze(-1)
-
-            base_energy = batch.base_energy
-            final_energy = base_energy + delta_energy
-            # ===================================================
-
-            output = {"energy": final_energy, "delta_energy": delta_energy}
-
-            # --- Now, the original evaluation logic ---
-            loss = loss_fn(
-                output, batch
-            )  # loss_fn compares output["delta_energy"] and batch.y
-            total_loss += loss.item() * batch.num_graphs
-
-            all_pred_deltas.append(output["delta_energy"].cpu())
-            all_true_deltas.append(batch.y.cpu())
-
-            pred_final_energies = output["energy"].cpu()
-            true_final_energies = batch.true_final_energy.cpu()
-
-            num_atoms = (batch.ptr[1:] - batch.ptr[:-1]).cpu().to(pred_final_energies.dtype)
-
-            abs_error_per_atom = (
-                torch.abs(pred_final_energies - true_final_energies) / num_atoms
-            )
-            all_final_energy_abs_errors_per_atom.append(abs_error_per_atom)
-
-    avg_loss = total_loss / len(data_loader.dataset)
-    all_pred_deltas = torch.cat(all_pred_deltas)
-    all_true_deltas = torch.cat(all_true_deltas)
-    all_final_energy_abs_errors_per_atom = torch.cat(
-        all_final_energy_abs_errors_per_atom
-    )
-
-    delta_mae = torch.mean(torch.abs(all_pred_deltas - all_true_deltas)).item()
-    delta_rmse = torch.sqrt(
-        torch.mean((all_pred_deltas - all_true_deltas) ** 2)
-    ).item()
-    final_energy_mae_per_atom = torch.mean(
-        all_final_energy_abs_errors_per_atom
-    ).item()
-
-    return avg_loss, delta_mae, delta_rmse, final_energy_mae_per_atom
 
