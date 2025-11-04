@@ -27,31 +27,28 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 def main():
-    start_time = time.time() # <-- Added
-    # --- Configuration (same as your script) ---
-    print("This is the new version")
-    training_dataset_path = "subsumple_finite_training_dataset.xyz"
-    validation_dataset_path = "subsumple_pbc_validation_dataset.xyz"
-    base_model_path = "/mnt/storage_3/home/krystyna_syty/pl0415-02/scratch/mace-doual-Krysia/fundational_models/MACE-MP_small.model"
-    high_accuracy_model_path = "/mnt/storage_3/home/krystyna_syty/pl0415-02/scratch/mace-doual-Krysia/fundational_models/MACE-OFF24_medium.model"
-    
-    epochs = 1000
-    lr = 1e-3
+    start_time = time.time() 
+    #Configuration
+    training_dataset_path = "{training_dataset.xyz}"
+    validation_dataset_path = "{validation_dataset.xyz}"
+    base_model_path = "{base_model.model}"
+    high_accuracy_model_path = "{hoght_model.model}"
+    epochs = "{N_epochs}"
+    lr = "{lr}"
     batch_size = 10
     output_dir = "delta_model_checkpoints"
     
-    mlp_hidden_features = "auto" 
-    mlp_activation = "silu"
-    use_pca = True
-    pca_variance_threshold = 0.999
-    # --- End of Configuration ---
-
+    mlp_hidden_features = "{n_hidden}" # "auto" or an np.array 
+    mlp_activation = {"activation_type"} #silu or swiglu
+    use_pca = {"True"} #bool True or False
+    pca_variance_threshold = {"threshold"}
+    #End of configuration
     os.makedirs(output_dir, exist_ok=True)
     device_str = "cuda" if torch.cuda.is_available() else "cpu" 
     device = torch.device(device_str)
     logging.info(f"Using device: {device_str}")
 
-    # --- 1. Load Data (as before) ---
+    # --- 1. Load Data ---
     logging.info(f"Loading training data from: '{training_dataset_path}'")
     training_atoms_list = load_data(training_dataset_path)
     logging.info(f"Loading validation data from: '{validation_dataset_path}'")
@@ -59,7 +56,7 @@ def main():
     full_atoms_list = training_atoms_list + validation_atoms_list
     logging.info(f"Total structures loaded: {len(full_atoms_list)}")
 
-    # --- 2. Load Base Model and Calculate Shifts (as before) ---
+    # --- 2. Load Base Model and Calculate Shifts  ---
     base_mace_model = torch.load(base_model_path, map_location=device)
     base_mace_model.to(dtype=torch.float64).eval()
     
@@ -84,7 +81,7 @@ def main():
     )
     shifts_for_model = torch.tensor(epera_regression_shifts, dtype=torch.float64, device=device)
 
-    # --- 3. Create ORIGINAL Datasets and PyG Loaders (for feature extraction) ---
+    # --- 3. Create ORIGINAL Datasets and PyG Loaders ---
     train_dataset_pyg = AtomsDataset(training_atoms_list, r_max=r_max, z_map=z_map)
     val_dataset_pyg = AtomsDataset(validation_atoms_list, r_max=r_max, z_map=z_map)
     
@@ -92,7 +89,7 @@ def main():
     pyg_train_loader = PyGDataLoader(train_dataset_pyg, batch_size=32, shuffle=False, collate_fn=pyg_collate)
     pyg_val_loader = PyGDataLoader(val_dataset_pyg, batch_size=32, shuffle=False, collate_fn=pyg_collate)
 
-    # --- 4. Create Feature Extractor Model (Original DualReadoutMACE) ---
+    # --- 4. Create Feature Extractor Model ---
     # We only use this model once for pre-computation
     feature_extractor = DualReadoutMACE(
         base_mace_model=base_mace_model, 
@@ -104,7 +101,7 @@ def main():
         pca_variance_threshold=pca_variance_threshold
     ).to(device)
     
-    # --- 5. RUN PRE-COMPUTATION (THE NEW STEP) ---
+    # --- 5. RUN PRE-COMPUTATION ---
     (
         train_features, train_node_attrs, train_targets, 
         train_base_energies, train_true_final_energies, train_ptr
