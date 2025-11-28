@@ -1,3 +1,4 @@
+# models_cached.py 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,8 +10,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 from mace.calculators import MACECalculator
 
 from ase import Atoms
-from models.models import DualReadoutMACE, compute_E_statistics_vectorized, PCALayer, MLPReadout 
 
+from models.models import PCALayer, MLPReadout, ScaleShiftBlock 
 
 class CachedReadoutModel(nn.Module):
     """
@@ -20,18 +21,59 @@ class CachedReadoutModel(nn.Module):
     def __init__(
         self,
         in_features: int,
-        vacuum_energy_shifts: torch.Tensor,
-        mlp_hidden_features: List[int],
-        mlp_activation: str,
-        use_pca: bool,
-        pca_variance_threshold: float,
-        z_map: Dict[int, int]
+        atomic_energy_shifts: torch.Tensor,
+        atomic_inter_scale: float,
+        atomic_inter_shift: float,
+        mlp_hidden_features: List[int],    
+        mlp_activation: str,              
+        use_pca: bool,                    
+        pca_variance_threshold: float,    
+        z_map: Dict[int, int],
+        mlp_dropout_p: float = 0.0,      
+        shift_type: str = 'atomic',
+        molecular_energy_shift: float = None, # This is now the PER-ATOM shift
+        n_atoms_per_molecule: int = None      # No longer used in forward pass
     ):
         super().__init__()
         self.use_pca = use_pca
         self.z_map = z_map
         self.n_species = len(z_map)
         
+        self.shift_type = shift_type.lower()
+        # self.molecular_energy_shift = molecular_energy_shift # <-- OLD
+        self.n_atoms_per_molecule = n_atoms_per_molecule 
+        
+        self.mlp_dropout_p = mlp_dropout_p
+        
+        # --- MODIFICATION: Handle Shifts ---
+        if self.shift_type == 'atomic':
+            if atomic_energy_shifts is not None:
+                # Store as a trainable parameter
+                self.atomic_energy_shifts = nn.Parameter(atomic_energy_shifts)
+                logging.info("Registered 'atomic' shifts as a TRAINABLE nn.Parameter.")
+            else:
+                logging.warning("shift_type='atomic' but no shifts provided. Using a non-trainable zero buffer.")
+                self.register_buffer('atomic_energy_shifts', torch.tensor(0.0, dtype=torch.float64))
+        else:
+            # Not atomic shift_type, store 0 as a buffer
+            self.register_buffer('atomic_energy_shifts', torch.tensor(0.0, dtype=torch.float64))
+
+        if self.shift_type == 'molecular':
+            if molecular_energy_shift is not None:
+                 # Store as a trainable parameter
+                 self.molecular_energy_shift = nn.Parameter(torch.tensor(molecular_energy_shift, dtype=torch.float64))
+                 logging.info("Registered 'molecular' shift as a TRAINABLE nn.Parameter.")
+            else:
+                 raise ValueError("For shift_type='molecular', 'molecular_energy_shift' must be provided.")
+        else:
+            self.molecular_energy_shift = molecular_energy_shift # Stays None
+        # --- END MODIFICATION ---
+        
+        if self.shift_type == 'molecular' and self.molecular_energy_shift is None:
+            # This check is now redundant, but safe to leave
+            raise ValueError(
+                "For shift_type='molecular' you have to initiate 'molecular_energy_shift' (as the pre-calculated per-atom shift value)."
+            )
         self.pca_layer = None
         if self.use_pca:
             self.pca_layer = PCALayer(
@@ -43,13 +85,16 @@ class CachedReadoutModel(nn.Module):
         self.mlp_hidden_features_config = mlp_hidden_features
         self.mlp_activation = mlp_activation
         
-        if vacuum_energy_shifts is not None:
-            self.register_buffer('atomic_energy_shifts', vacuum_energy_shifts)
-        else:
-            self.atomic_energy_shifts = 0
+       # if atomic_energy_shifts is not None:
+       #     self.register_buffer('atomic_energy_shifts', atomic_energy_shifts)
+       # else:
+       #     self.atomic_energy_shifts = 0
+            
+        self.scale_shift = ScaleShiftBlock(
+            scale=atomic_inter_scale, shift=atomic_inter_shift
+        )
 
     def finalize_model(self, features: torch.Tensor):
-        """Fits PCA (if used) and initializes the MLP readout head."""
         readout_in_features = features.shape[1]
         
         if self.use_pca:
@@ -62,22 +107,29 @@ class CachedReadoutModel(nn.Module):
             logging.info(f"Automatically determined MLP hidden features: {final_mlp_hidden_features}")
         else:
             final_mlp_hidden_features = self.mlp_hidden_features_config
-        device = self.pca_layer.mean.device
-        dtype = self.pca_layer.mean.dtype
+            
+
+        if self.use_pca and self.pca_layer.fitted:
+             device = self.pca_layer.mean.device
+             dtype = self.pca_layer.mean.dtype
+        else:
+             device = features.device
+             dtype = features.dtype
 
         logging.info(f"Finalizing model. Readout head will have {readout_in_features} input features.")
+
         self.delta_readout = MLPReadout(
             in_features=readout_in_features,
             hidden_features=final_mlp_hidden_features,
             activation=self.mlp_activation,
-            out_features=1
+            out_features=1,
+            dropout_p=self.mlp_dropout_p  # <-- PASS DROPOUT HERE
         )
+        
         self.delta_readout.to(device=device, dtype=dtype)
-        # Zero-initialize the final layer
-        final_layer = self.delta_readout.mlp[-1]
-        torch.nn.init.zeros_(final_layer.weight)
-        if final_layer.bias is not None:
-             torch.nn.init.zeros_(final_layer.bias)
+        
+        self.scale_shift.to(device=device, dtype=dtype)
+        
         logging.info("CachedReadoutModel has been finalized.")
 
     def forward(self, data: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -93,22 +145,38 @@ class CachedReadoutModel(nn.Module):
         base_energy = data['base_energy']
 
         processed_features = self.pca_layer(features) if self.use_pca else features
+        
+        # 1. Get raw prediction from MLP (dropout is applied here if model is in train() mode)
         atomic_delta_prediction = self.delta_readout(processed_features)
         
-        # Apply atomic energy shifts (from regression)
-        if isinstance(self.atomic_energy_shifts, torch.Tensor):
-            # We need the node_attrs to find the species index
-            node_indices = torch.argmax(data['node_attrs'], dim=1)
-            shifts = self.atomic_energy_shifts[node_indices].unsqueeze(-1)
-            total_atomic_delta = atomic_delta_prediction + shifts
-        else:
-            total_atomic_delta = atomic_delta_prediction
+        # 2. Apply scale/shift (the "residual" part)
+        scaled_atomic_delta = self.scale_shift(atomic_delta_prediction)
+        
+        # 3. Apply 'atomic' or 'molecular' per-atom shift (if active)
+        if self.shift_type == 'atomic':
+            if isinstance(self.atomic_energy_shifts, torch.Tensor):
+                node_indices = torch.argmax(data['node_attrs'], dim=1)
+                shifts = self.atomic_energy_shifts[node_indices].unsqueeze(-1)
+                total_atomic_delta = scaled_atomic_delta + shifts
+            else:
+                total_atomic_delta = scaled_atomic_delta
+        
+        elif self.shift_type == 'molecular':
+            # Apply the single per-atom shift value (pre-calculated and stored) to all atoms
+            total_atomic_delta = scaled_atomic_delta + self.molecular_energy_shift
+            
+        else: # 'none'
+            # For 'none', the per-atom delta is just the scaled prediction
+            total_atomic_delta = scaled_atomic_delta
 
-        # Sum per-atom deltas to get per-graph delta
+        # 4. Sum per-atom deltas to get per-graph delta
         delta_energy = global_add_pool(total_atomic_delta, batch_map).squeeze(-1)
         
-        # Reconstruct the final energy (Base MACE Energy + Predicted Delta)
+        # 5. Reconstruct intermediate energy
         final_energy = base_energy + delta_energy
+            
+        if self.shift_type not in ['atomic', 'molecular', 'none']:
+             raise ValueError(f"Invalid shift_type: {self.shift_type}. Must be 'atomic', 'molecular', or 'none'.")
 
         return {
             "energy": final_energy,
