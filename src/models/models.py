@@ -154,6 +154,7 @@ class MLPReadout(nn.Module):
 
         self.dropout_p = dropout_p  # <-- NEW
 
+
         layers = []
         current_features = in_features
 
@@ -177,8 +178,8 @@ class MLPReadout(nn.Module):
 
 
         # Create the final output layer
-        layers.append(nn.Linear(current_features, out_features, bias=False)) 
-
+        #layers.append(nn.Linear(current_features, out_features, bias=False)) 
+        layers.append(nn.Linear(current_features, out_features, bias=True))  
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -234,24 +235,49 @@ class DualReadoutMACE(nn.Module):
         pca_variance_threshold: float = 0.99
     ):
         super().__init__()
-        self.features = None # This will be populated by the hook
+        self.features = None 
         self.mace_model = base_mace_model
         self.use_pca = use_pca
         self.shift_type = shift_type.lower()
         
-        self.molecular_energy_shift = molecular_energy_shift
-        self.n_atoms_per_molecule = n_atoms_per_molecule
+        # self.molecular_energy_shift = molecular_energy_shift # <-- OLD
+        # self.n_atoms_per_molecule = n_atoms_per_molecule # <-- OLD
         
-        if self.shift_type == 'molecular' and (self.molecular_energy_shift is None or self.n_atoms_per_molecule is None):
+        if self.shift_type == 'molecular' and (molecular_energy_shift is None or n_atoms_per_molecule is None): # <-- Check arg
             raise ValueError(
                 "For shift_type='molecular' you must provide 'molecular_energy_shift' (float) and 'n_atoms_per_molecule' (int)."
             )
-        if self.shift_type == 'molecular' and self.n_atoms_per_molecule <= 0:
+        if self.shift_type == 'molecular' and n_atoms_per_molecule <= 0:
              raise ValueError("'n_atoms_per_molecule' must be a positive integer")
+        
+        self.n_atoms_per_molecule = n_atoms_per_molecule # <-- Store this
 
         self.mlp_hidden_features_config = mlp_hidden_features
         self.mlp_activation = mlp_activation
-        self.mlp_dropout_p = mlp_dropout_p # <-- STORED THIS
+        self.mlp_dropout_p = mlp_dropout_p
+    
+        # --- MODIFICATION: Handle Shifts ---
+        if self.shift_type == 'atomic':
+            if atomic_energy_shifts is not None:
+                # Store as a trainable parameter, initialized with the regression values
+                self.atomic_energy_shifts = nn.Parameter(atomic_energy_shifts)
+                logging.info("Registered 'atomic' shifts as a TRAINABLE nn.Parameter.")
+            else:
+                logging.warning("shift_type='atomic' but no shifts provided. Using a non-trainable zero buffer.")
+                self.register_buffer('atomic_energy_shifts', torch.tensor(0.0, dtype=torch.float64))
+        else:
+            # Not atomic shift_type, store 0 as a buffer
+            self.register_buffer('atomic_energy_shifts', torch.tensor(0.0, dtype=torch.float64))
+
+        if self.shift_type == 'molecular':
+            if molecular_energy_shift is not None:
+                 # Store as a trainable parameter, initialized with the calculated per-atom value
+                 self.molecular_energy_shift = nn.Parameter(torch.tensor(molecular_energy_shift, dtype=torch.float64))
+                 logging.info("Registered 'molecular' shift as a TRAINABLE nn.Parameter.")
+            # else: The error was already raised above
+        else:
+            self.molecular_energy_shift = molecular_energy_shift # Stays None
+        # --- END MODIFICATION ---
     
         logging.info("Freezing parameters of the entire base MACE model...")
         for param in self.mace_model.parameters():
@@ -278,14 +304,14 @@ class DualReadoutMACE(nn.Module):
         # The readout head is "lazy" - it will be created in finalize_model()
         self.delta_readout = None
         
-        if atomic_energy_shifts is not None:
-            self.register_buffer('atomic_energy_shifts', atomic_energy_shifts)
-            logging.info("Registered atomic (regression) energy shifts.")
-        else:
-            self.atomic_energy_shifts = 0 # Use a scalar 0 if not provided
+        #if atomic_energy_shifts is not None:
+        #    self.register_buffer('atomic_energy_shifts', atomic_energy_shifts)
+        #    logging.info("Registered atomic (regression) energy shifts.")
+        #else:
+        #    self.atomic_energy_shifts = 0 # Use a scalar 0 if not provided
 
-        if self.shift_type == 'atomic' and not isinstance(self.atomic_energy_shifts, torch.Tensor):
-            logging.warning("shift_type is 'atomic' but no atomic_energy_shifts tensor was provided.")
+        #if self.shift_type == 'atomic' and not isinstance(self.atomic_energy_shifts, torch.Tensor):
+        #    logging.warning("shift_type is 'atomic' but no atomic_energy_shifts tensor was provided.")
             
         self.scale_shift = ScaleShiftBlock(
             scale=atomic_inter_scale, shift=atomic_inter_shift
@@ -365,8 +391,12 @@ class DualReadoutMACE(nn.Module):
             self.delta_readout.to(device=device, dtype=dtype)
         if self.scale_shift is not None:
              self.scale_shift.to(device=device, dtype=dtype)
-        if isinstance(self.atomic_energy_shifts, torch.Tensor):
+       # if isinstance(self.atomic_energy_shifts, torch.Tensor):
+       #      self.atomic_energy_shifts = self.atomic_energy_shifts.to(device=device, dtype=dtype)
+       # # Only move atomic_energy_shifts if it's a BUFFER (i.e., NOT a Parameter)
+        if not isinstance(self.atomic_energy_shifts, nn.Parameter):
              self.atomic_energy_shifts = self.atomic_energy_shifts.to(device=device, dtype=dtype)
+        # molecular_energy_shift is either a Parameter (moved by super().to()) or None
         return self
 
     def _hook_fn(self, module, input_data, output_data):
