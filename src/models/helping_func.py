@@ -10,7 +10,21 @@ from mace.calculators import MACECalculator
 
 from ase import Atoms
 
-
+def generate_molecular_shift(molecule, high_accuracy_calculator, low_accuracy_calculator):
+    """
+    Calculates the energy delta for a single relaxed molecule between two calculators.
+    """
+    logging.info(f"Relaxing reference molecule {molecule.get_chemical_formula()} with high-accuracy calc...")
+    relaxed_molecule = relaxe_molecule(molecule, high_accuracy_calculator)
+    relaxed_molecule.calc = high_accuracy_calculator
+    E_molecule_high = relaxed_molecule.get_potential_energy()
+    logging.info(f"  - High-accuracy energy: {E_molecule_high:.6f} eV")
+    relaxed_molecule.calc = low_accuracy_calculator
+    E_molecule_low = relaxed_molecule.get_potential_energy()
+    logging.info(f"  - Low-accuracy energy: {E_molecule_low:.6f} eV")
+    delta_energy = E_molecule_high - E_molecule_low
+    logging.info(f"  - Calculated delta (High - Low): {delta_energy:.6f} eV")
+    return delta_energy
 
 def get_vacuum_energies(calc_mace_off: MACECalculator, calc_mace_mp: MACECalculator, z_list: List[int]) -> Dict[int, float]:
     """Calculates the energy (mace_off) for single, isolated atoms."""
