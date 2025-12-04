@@ -101,8 +101,9 @@ class PCALayer(nn.Module):
         x_centered = x - self.mean
         x_projected = x_centered @ self.components
         x_standardized = x_projected / self.scales
-        
-        return x_standardized
+        x_normalized = F.normalize(x_standardized, p=2, dim=1)
+
+        return x_normalized
 
     def __repr__(self):
         return (f"PCALayer(in_features={self.in_features}, "
