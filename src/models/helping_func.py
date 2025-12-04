@@ -60,4 +60,29 @@ def print_model_summary(model: nn.Module):
         print("  - No trainable parameters found.")
         
     print("="*80)
+
+
+def check_feature_normalization(features: torch.Tensor, tolerance: float = 1e-4):
+    """
+    Checks if the feature vectors are normalized to length 1 (Unit Norm).
+    """
+    logging.info("--- Checking Feature Normalization (Post-PCA) ---")
+    norms = torch.linalg.norm(features, dim=1)
+    mean_norm = torch.mean(norms).item()
+    max_norm = torch.max(norms).item()
+    min_norm = torch.min(norms).item()
+    
+    is_normalized = torch.allclose(norms, torch.ones_like(norms), atol=tolerance)
+    
+    logging.info(f"    Mean Norm: {mean_norm:.6f}")
+    logging.info(f"    Max Norm:  {max_norm:.6f}")
+    logging.info(f"    Min Norm:  {min_norm:.6f}")
+    
+    if is_normalized:
+        logging.info("    [OK] Features are effectively normalized to 1.")
+    else:
+        logging.warning("    [WARNING] Features are NOT normalized to 1. This may affect Kernel performance.")
+    logging.info("-------------------------------------------------")
+    return is_normalized
+
     
